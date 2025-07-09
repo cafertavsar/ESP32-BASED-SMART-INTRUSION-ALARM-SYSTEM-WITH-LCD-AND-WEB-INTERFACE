@@ -1,0 +1,197 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+
+// WiFi bilgileri
+const char* ssid = "SUPERONLINE_WiFi_5438";
+const char* password = "puD2SegdVChq";
+
+// LCD tanımı
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Donanım pinleri
+#define LED_PIN     25
+#define BUZZER_PIN  26
+#define PIR_PIN     32
+#define LDR_PIN     36  // KY-018 LDR'nin bağlı olduğu analog pin
+
+// Sistem durumları
+bool systemArmed = false;
+bool buzzerMuted = false;
+
+// Zaman ve web sunucu
+WiFiServer server(80);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 3 * 3600, 60000);  // GMT+3
+
+void triggerAlarm() {
+  if (systemArmed) {
+    Serial.println("🚨 Alarm tetiklendi");
+
+    lcd.setCursor(0, 0);
+    lcd.print(timeClient.getFormattedTime());
+
+    lcd.setCursor(0, 1);
+    lcd.print("ALARM AKTIF!!! ");
+
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      if (!buzzerMuted) digitalWrite(BUZZER_PIN, HIGH);
+      delay(200);
+      digitalWrite(LED_PIN, LOW);
+      if (!buzzerMuted) digitalWrite(BUZZER_PIN, LOW);
+      delay(200);
+    }
+
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    updateLCD();
+  }
+}
+
+void resetAlarm() {
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  updateLCD();
+}
+
+void updateLCD() {
+  lcd.setCursor(0, 0);
+  lcd.print(timeClient.getFormattedTime());
+
+  lcd.setCursor(0, 1);
+  if (systemArmed)
+    lcd.print("ALARM PASIF    ");
+  else
+    lcd.print("SISTEM PASIF   ");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LDR_PIN, INPUT);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  updateLCD();
+
+  WiFi.begin(ssid, password);
+  Serial.print("WiFi baglaniyor");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+
+  timeClient.begin();
+  timeClient.update();
+  server.begin();
+  Serial.println("\n✅ Baglandi. IP: " + WiFi.localIP().toString());
+}
+
+void loop() {
+  timeClient.update();
+
+  // 🔄 LDR değeri oku ve ters çevir
+  int rawLDR = analogRead(LDR_PIN);
+  int ldrValue = 4095 - rawLDR;
+
+  Serial.print("💡 LDR: ");
+  Serial.println(ldrValue);
+
+  // ⚙ Otomatik sistem kurma/çözme mantığı
+  if (ldrValue > 2000 && systemArmed) {
+    systemArmed = false;
+    Serial.println("☀ Ortam aydınlık → Sistem çözüldü");
+    updateLCD();
+    
+  }
+  if (ldrValue < 800 && !systemArmed) {
+    systemArmed = true;
+    Serial.println("🌙 Ortam karanlık → Sistem kuruldu");
+    updateLCD();
+  }
+
+  // 📡 PIR tetikleme
+  static bool pirLast = LOW;
+  bool pirNow = digitalRead(PIR_PIN);
+  if (systemArmed && pirNow == HIGH && pirLast == LOW) {
+    triggerAlarm();
+  }
+  pirLast = pirNow;
+
+  // 🌐 Web arayüz
+  WiFiClient client = server.available();
+  if (client) {
+    String req = "";
+    while (client.connected() && client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.startsWith("GET")) req = line;
+      if (line.length() == 0) break;
+    }
+
+    if (req.indexOf("/ARM") != -1) {
+      systemArmed = true;
+      buzzerMuted = false;
+      resetAlarm();
+    }
+    if (req.indexOf("/DISARM") != -1) {
+      systemArmed = false;
+      resetAlarm();
+    }
+    if (req.indexOf("/TEST") != -1) {
+      triggerAlarm();
+    }
+    if (req.indexOf("/MUTE") != -1) {
+      buzzerMuted = true;
+    }
+
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='UTF-8'>
+  <title>ESP32 Alarm Sistemi</title>
+  <style>
+    body { font-family: Arial; background-color: #1b1b1b; color: white; text-align: center; padding: 20px; }
+    h2 { color: #00c0ff; }
+    .status { font-size: 1.4em; padding: 10px 20px; border-radius: 10px; margin: 20px auto; display: inline-block; }
+    .armed { background-color: #ff4444; }
+    .disarmed { background-color: #4caf50; }
+    button { padding: 12px 24px; font-size: 16px; margin: 10px; border: none; border-radius: 8px; cursor: pointer; transition: 0.3s; }
+    .btn-arm { background-color: #00796b; color: white; }
+    .btn-disarm { background-color: #c62828; color: white; }
+    .btn-test { background-color: #1565c0; color: white; }
+    .btn-mute { background-color: #9e9e9e; color: white; }
+    button:hover { opacity: 0.85; }
+    footer { margin-top: 30px; font-size: 0.9em; color: #aaa; }
+  </style>
+</head>
+<body>
+  <h2>ESP32 ALARM SİSTEMİ</h2>
+  <div class="status %STATUS_CLASS%">Durum: <b>%STATUS%</b></div><br>
+  <a href="/ARM"><button class="btn-arm">Sistemi Kur</button></a>
+  <a href="/DISARM"><button class="btn-disarm">Devre Dışı Bırak</button></a>
+  <a href="/TEST"><button class="btn-test">Test Alarmı Çal</button></a>
+  <a href="/MUTE"><button class="btn-mute">Sessiz Mod</button></a>
+  <footer>IP: %IP_ADDRESS%</footer>
+</body>
+</html>
+)rawliteral";
+
+    html.replace("%STATUS%", systemArmed ? "KURULDU" : "PASİF");
+    html.replace("%STATUS_CLASS%", systemArmed ? "armed" : "disarmed");
+    html.replace("%IP_ADDRESS%", WiFi.localIP().toString());
+
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/html\n");
+    client.println(html);
+    client.stop();
+  }
+
+  delay(200);
+}
